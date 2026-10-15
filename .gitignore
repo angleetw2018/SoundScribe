@@ -1,0 +1,18 @@
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local transcripts may contain private conversations
+transcripts/
+
+# Test and editor artifacts
+.pytest_cache/
+.coverage
+.idea/
+.vscode/
+
+# OS files
+Thumbs.db
+.DS_Store
