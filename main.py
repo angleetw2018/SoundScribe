@@ -10,7 +10,17 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 
-from transcript_core import TranscriptLine, TranscriptStore, clean_text, is_speech, to_mono_16k
+from transcript_core import (
+    RECORDING_MODES,
+    TranscriptLine,
+    TranscriptStore,
+    active_sources,
+    clean_text,
+    device_states,
+    is_speech,
+    split_audio_devices,
+    to_mono_16k,
+)
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -45,12 +55,17 @@ def load_audio_library():
     return pyaudio
 
 
-def list_loopback_devices() -> list[dict]:
+def list_audio_devices() -> tuple[list[dict], list[dict]]:
     pyaudio = load_audio_library()
     audio = pyaudio.PyAudio()
     try:
-        devices = list(audio.get_loopback_device_info_generator())
-        return [dict(item) for item in devices if int(item.get("maxInputChannels", 0)) > 0]
+        wasapi = audio.get_host_api_info_by_type(pyaudio.paWASAPI)
+        devices = [
+            dict(audio.get_device_info_by_index(index))
+            for index in range(audio.get_device_count())
+        ]
+        wasapi_devices = [item for item in devices if int(item.get("hostApi", -1)) == int(wasapi["index"])]
+        return split_audio_devices(wasapi_devices)
     finally:
         audio.terminate()
 
@@ -60,8 +75,9 @@ class TranscriptionWorker:
         self.events = events
         self.stop_event = stop_event
 
-    def run(self, device: dict, model_name: str, language: str | None) -> None:
-        stream = audio = None
+    def run(self, devices: dict[str, dict], model_name: str, language: str | None) -> None:
+        streams: dict[str, object] = {}
+        audio = None
         started = time.monotonic()
         store = TranscriptStore(TRANSCRIPT_DIR)
         try:
@@ -77,56 +93,69 @@ class TranscriptionWorker:
 
             pyaudio = load_audio_library()
             audio = pyaudio.PyAudio()
-            rate = int(device["defaultSampleRate"])
-            channels = int(device["maxInputChannels"])
             frames = 2048
-            stream = audio.open(
-                format=pyaudio.paInt16,
-                channels=channels,
-                rate=rate,
-                input=True,
-                input_device_index=int(device["index"]),
-                frames_per_buffer=frames,
-            )
-            target_frames = rate * channels * 5
-            pending: list[np.ndarray] = []
-            pending_count = 0
-            self.events.put(("started", f"監聽中 · {engine} · {device['name']}", str(store.path)))
+            states: dict[str, dict] = {}
+            for source, device in devices.items():
+                rate = int(device["defaultSampleRate"])
+                channels = int(device["maxInputChannels"])
+                streams[source] = audio.open(
+                    format=pyaudio.paInt16,
+                    channels=channels,
+                    rate=rate,
+                    input=True,
+                    input_device_index=int(device["index"]),
+                    frames_per_buffer=frames,
+                )
+                states[source] = {
+                    "rate": rate,
+                    "channels": channels,
+                    "target": rate * channels * 5,
+                    "pending": [],
+                    "count": 0,
+                }
+            source_names = "＋".join(devices)
+            self.events.put(("started", f"監聽中 · {engine} · {source_names}", str(store.path)))
 
             while not self.stop_event.is_set():
-                raw = stream.read(frames, exception_on_overflow=False)
-                block = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-                pending.append(block)
-                pending_count += block.size
-                if pending_count < target_frames:
-                    continue
-                chunk = to_mono_16k(np.concatenate(pending), rate, channels)
-                pending.clear()
-                pending_count = 0
-                if not is_speech(chunk):
-                    self.events.put(("level", "略過靜音片段"))
-                    continue
-                self.events.put(("level", "正在辨識…"))
-                try:
-                    text = transcribe_chunk(model, chunk, language)
-                except Exception as exc:
-                    if engine != "NVIDIA GPU" or not is_cuda_runtime_error(exc):
-                        raise
-                    self.events.put(("level", "CUDA 元件不完整，正在自動切換至 CPU…"))
-                    del model
-                    model = WhisperModel(model_name, device="cpu", compute_type="int8")
-                    engine = "CPU"
-                    text = transcribe_chunk(model, chunk, language)
-                    self.events.put(("engine", f"已切換至 CPU · {device['name']}"))
-                if text:
-                    line = TranscriptLine(time.monotonic() - started, text)
-                    store.append(line)
-                    self.events.put(("text", line.render()))
-                self.events.put(("level", "等待語音…"))
+                for source, stream in streams.items():
+                    state = states[source]
+                    raw = stream.read(frames, exception_on_overflow=False)
+                    block = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                    state["pending"].append(block)
+                    state["count"] += block.size
+                    if state["count"] < state["target"]:
+                        continue
+                    chunk = to_mono_16k(
+                        np.concatenate(state["pending"]),
+                        state["rate"],
+                        state["channels"],
+                    )
+                    state["pending"].clear()
+                    state["count"] = 0
+                    if not is_speech(chunk):
+                        self.events.put(("level", f"{source}：略過靜音片段"))
+                        continue
+                    self.events.put(("level", f"正在辨識{source}聲音…"))
+                    try:
+                        text = transcribe_chunk(model, chunk, language)
+                    except Exception as exc:
+                        if engine != "NVIDIA GPU" or not is_cuda_runtime_error(exc):
+                            raise
+                        self.events.put(("level", "CUDA 元件不完整，正在自動切換至 CPU…"))
+                        del model
+                        model = WhisperModel(model_name, device="cpu", compute_type="int8")
+                        engine = "CPU"
+                        text = transcribe_chunk(model, chunk, language)
+                        self.events.put(("engine", f"已切換至 CPU · {source_names}"))
+                    if text:
+                        line = TranscriptLine(time.monotonic() - started, text, source)
+                        store.append(line)
+                        self.events.put(("text", line.render()))
+                    self.events.put(("level", "等待語音…"))
         except Exception as exc:
             self.events.put(("error", str(exc)))
         finally:
-            if stream is not None:
+            for stream in streams.values():
                 stream.stop_stream()
                 stream.close()
             if audio is not None:
@@ -144,7 +173,8 @@ class App(tk.Tk):
         self.events: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
         self.worker_thread: threading.Thread | None = None
-        self.devices: list[dict] = []
+        self.system_devices: list[dict] = []
+        self.microphone_devices: list[dict] = []
         self.current_transcript: Path | None = None
         self._build_ui()
         self.after(100, self._poll_events)
@@ -166,17 +196,25 @@ class App(tk.Tk):
 
         settings = ttk.Frame(root)
         settings.pack(fill="x")
-        ttk.Label(settings, text="音訊裝置").grid(row=0, column=0, sticky="w")
+        ttk.Label(settings, text="錄音模式").grid(row=0, column=0, sticky="w")
         ttk.Label(settings, text="模型").grid(row=0, column=1, sticky="w", padx=(12, 0))
         ttk.Label(settings, text="語言").grid(row=0, column=2, sticky="w", padx=(12, 0))
-        self.device_box = ttk.Combobox(settings, state="readonly")
-        self.device_box.grid(row=1, column=0, sticky="ew", pady=(5, 0))
+        self.mode_box = ttk.Combobox(settings, state="readonly", values=tuple(RECORDING_MODES), width=16)
+        self.mode_box.set("兩者都錄")
+        self.mode_box.grid(row=1, column=0, sticky="ew", pady=(5, 0))
+        self.mode_box.bind("<<ComboboxSelected>>", self._sync_device_states)
         self.model_box = ttk.Combobox(settings, state="readonly", values=MODELS, width=12)
         self.model_box.set("small")
         self.model_box.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(5, 0))
         self.language_box = ttk.Combobox(settings, state="readonly", values=tuple(LANGUAGES), width=17)
         self.language_box.set("繁體中文／中文")
         self.language_box.grid(row=1, column=2, sticky="ew", padx=(12, 0), pady=(5, 0))
+        ttk.Label(settings, text="電腦聲音裝置").grid(row=2, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        self.system_device_box = ttk.Combobox(settings, state="readonly")
+        self.system_device_box.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(5, 0))
+        ttk.Label(settings, text="麥克風裝置").grid(row=4, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        self.microphone_device_box = ttk.Combobox(settings, state="readonly")
+        self.microphone_device_box.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(5, 0))
         settings.columnconfigure(0, weight=1)
 
         controls = ttk.Frame(root)
@@ -200,31 +238,48 @@ class App(tk.Tk):
         if self.worker_thread and self.worker_thread.is_alive():
             return
         try:
-            self.devices = list_loopback_devices()
-            self.device_box["values"] = [item["name"] for item in self.devices]
-            if self.devices:
-                self.device_box.current(0)
-                self.status.config(text=f"找到 {len(self.devices)} 個輸出裝置")
-            else:
-                self.status.config(text="找不到可監聽的輸出裝置")
+            self.system_devices, self.microphone_devices = list_audio_devices()
+            self.system_device_box["values"] = [item["name"] for item in self.system_devices]
+            self.microphone_device_box["values"] = [item["name"] for item in self.microphone_devices]
+            if self.system_devices:
+                self.system_device_box.current(0)
+            if self.microphone_devices:
+                self.microphone_device_box.current(0)
+            self._sync_device_states()
+            self.status.config(
+                text=f"找到 {len(self.system_devices)} 個電腦音訊、{len(self.microphone_devices)} 個麥克風"
+            )
         except Exception as exc:
             self.status.config(text="缺少音訊套件")
             messagebox.showerror("無法讀取音訊裝置", str(exc))
+
+    def _sync_device_states(self, _event=None) -> None:
+        system_state, microphone_state = device_states(self.mode_box.get())
+        self.system_device_box.config(state=system_state)
+        self.microphone_device_box.config(state=microphone_state)
 
     def toggle(self) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
             self.stop_event.set()
             self.start_button.config(state="disabled", text="正在停止…")
             return
-        index = self.device_box.current()
-        if index < 0:
-            messagebox.showwarning("尚未選擇裝置", "請先選擇要監聽的喇叭或耳機。")
-            return
+        devices: dict[str, dict] = {}
+        for source in active_sources(self.mode_box.get()):
+            if source == "電腦":
+                index = self.system_device_box.current()
+                options = self.system_devices
+            else:
+                index = self.microphone_device_box.current()
+                options = self.microphone_devices
+            if index < 0:
+                messagebox.showwarning("尚未選擇裝置", f"請先選擇{source}裝置。")
+                return
+            devices[source] = options[index]
         self.stop_event.clear()
         worker = TranscriptionWorker(self.events, self.stop_event)
         self.worker_thread = threading.Thread(
             target=worker.run,
-            args=(self.devices[index], self.model_box.get(), LANGUAGES[self.language_box.get()]),
+            args=(devices, self.model_box.get(), LANGUAGES[self.language_box.get()]),
             daemon=True,
         )
         self.worker_thread.start()

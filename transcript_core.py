@@ -8,6 +8,35 @@ import time
 import numpy as np
 
 
+RECORDING_MODES = {
+    "只錄電腦": ("電腦",),
+    "只錄麥克風": ("麥克風",),
+    "兩者都錄": ("電腦", "麥克風"),
+}
+
+
+def active_sources(mode: str) -> tuple[str, ...]:
+    try:
+        return RECORDING_MODES[mode]
+    except KeyError as exc:
+        raise ValueError(f"未知的錄音模式：{mode}") from exc
+
+
+def device_states(mode: str) -> tuple[str, str]:
+    sources = active_sources(mode)
+    return (
+        "readonly" if "電腦" in sources else "disabled",
+        "readonly" if "麥克風" in sources else "disabled",
+    )
+
+
+def split_audio_devices(devices: list[dict]) -> tuple[list[dict], list[dict]]:
+    active = [item for item in devices if int(item.get("maxInputChannels", 0)) > 0]
+    system = [item for item in active if bool(item.get("isLoopbackDevice"))]
+    microphones = [item for item in active if not bool(item.get("isLoopbackDevice"))]
+    return system, microphones
+
+
 def to_mono_16k(samples: np.ndarray, source_rate: int, channels: int) -> np.ndarray:
     """Convert interleaved float32 audio to mono 16 kHz float32."""
     if channels < 1 or source_rate < 1:
@@ -47,9 +76,10 @@ def format_timestamp(seconds: float) -> str:
 class TranscriptLine:
     elapsed: float
     text: str
+    source: str
 
     def render(self) -> str:
-        return f"[{format_timestamp(self.elapsed)}] {self.text}"
+        return f"[{format_timestamp(self.elapsed)}] [{self.source}] {self.text}"
 
 
 class TranscriptStore:
