@@ -12,6 +12,7 @@ transcripts/
 .coverage
 .idea/
 .vscode/
+.worktrees/
 
 # OS files
 Thumbs.db
