@@ -129,6 +129,17 @@ class TranscriptionWorker:
             if audio is not None:
                 audio.terminate()
 
+    def _next_chunk(self, chunks: AudioChunkBuffer, capture_errors: queue.Queue):
+        if not capture_errors.empty():
+            source, error = capture_errors.get_nowait()
+            raise RuntimeError(f"{source}音訊擷取失敗：{error}") from error
+        if self.stop_event.is_set():
+            return None
+        try:
+            return chunks.get(timeout=0.1)
+        except queue.Empty:
+            return None
+
     def run(self, devices: dict[str, dict], model_name: str, language: str | None) -> None:
         started = time.monotonic()
         store = TranscriptStore(TRANSCRIPT_DIR)
@@ -163,12 +174,10 @@ class TranscriptionWorker:
                 or not chunks.empty()
                 or not capture_errors.empty()
             ):
-                if not capture_errors.empty():
-                    source, error = capture_errors.get_nowait()
-                    raise RuntimeError(f"{source}音訊擷取失敗：{error}") from error
-                try:
-                    captured = chunks.get(timeout=0.1)
-                except queue.Empty:
+                captured = self._next_chunk(chunks, capture_errors)
+                if captured is None:
+                    if self.stop_event.is_set():
+                        break
                     continue
                 self.events.put(("level", f"正在辨識{captured.source}聲音…"))
                 try:

@@ -126,6 +126,19 @@ class TranscriptCoreTests(unittest.TestCase):
         self.assertTrue(errors.empty())
         self.assertEqual(chunks.get_nowait().source, "麥克風")
 
+    def test_stop_request_does_not_drain_queued_transcription_backlog(self):
+        self.assertTrue(hasattr(TranscriptionWorker, "_next_chunk"), "停止後仍會處理積壓音訊")
+        stop_event = threading.Event()
+        stop_event.set()
+        worker = TranscriptionWorker(__import__("queue").Queue(), stop_event)
+        chunks = transcript_core.AudioChunkBuffer(maxsize=2)
+        chunks.submit("電腦", 5.0, np.array([1.0], dtype=np.float32))
+
+        result = worker._next_chunk(chunks, __import__("queue").Queue())
+
+        self.assertIsNone(result)
+        self.assertFalse(chunks.empty(), "停止時不應繼續取出排隊片段")
+
 
 if __name__ == "__main__":
     unittest.main()
