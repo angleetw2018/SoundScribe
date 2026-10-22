@@ -139,6 +139,29 @@ class TranscriptCoreTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertFalse(chunks.empty(), "停止時不應繼續取出排隊片段")
 
+    def test_capture_error_arriving_with_stop_is_not_reported_as_normal_stop(self):
+        import queue
+
+        class RacingErrorQueue:
+            calls = 0
+
+            def empty(self):
+                return True
+
+            def get_nowait(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise queue.Empty
+                return "麥克風", RuntimeError("device disconnected")
+
+        stop_event = threading.Event()
+        stop_event.set()
+        worker = TranscriptionWorker(queue.Queue(), stop_event)
+        chunks = transcript_core.AudioChunkBuffer(maxsize=1)
+
+        with self.assertRaisesRegex(RuntimeError, "麥克風音訊擷取失敗"):
+            worker._next_chunk(chunks, RacingErrorQueue())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -130,10 +130,18 @@ class TranscriptionWorker:
                 audio.terminate()
 
     def _next_chunk(self, chunks: AudioChunkBuffer, capture_errors: queue.Queue):
-        if not capture_errors.empty():
-            source, error = capture_errors.get_nowait()
+        def raise_capture_error_if_present() -> None:
+            try:
+                source, error = capture_errors.get_nowait()
+            except queue.Empty:
+                return
             raise RuntimeError(f"{source}音訊擷取失敗：{error}") from error
+
+        raise_capture_error_if_present()
         if self.stop_event.is_set():
+            # Capture workers enqueue the error before setting stop. Recheck after
+            # observing stop so that interleaving cannot look like a normal stop.
+            raise_capture_error_if_present()
             return None
         try:
             return chunks.get(timeout=0.1)
