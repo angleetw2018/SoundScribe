@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import itertools
 from pathlib import Path
+import queue
 import re
 import time
 
@@ -35,6 +37,37 @@ def split_audio_devices(devices: list[dict]) -> tuple[list[dict], list[dict]]:
     system = [item for item in active if bool(item.get("isLoopbackDevice"))]
     microphones = [item for item in active if not bool(item.get("isLoopbackDevice"))]
     return system, microphones
+
+
+@dataclass(order=True, frozen=True)
+class AudioChunk:
+    elapsed: float
+    sequence: int
+    source: str = field(compare=False)
+    audio: np.ndarray = field(compare=False, repr=False)
+
+
+class AudioChunkBuffer:
+    def __init__(self, maxsize: int = 12) -> None:
+        self._queue: queue.PriorityQueue[AudioChunk] = queue.PriorityQueue(maxsize=maxsize)
+        self._sequence = itertools.count()
+
+    def submit(self, source: str, elapsed: float, audio: np.ndarray) -> bool:
+        item = AudioChunk(elapsed, next(self._sequence), source, audio)
+        try:
+            self._queue.put_nowait(item)
+            return True
+        except queue.Full:
+            return False
+
+    def get(self, timeout: float | None = None) -> AudioChunk:
+        return self._queue.get(timeout=timeout)
+
+    def get_nowait(self) -> AudioChunk:
+        return self._queue.get_nowait()
+
+    def empty(self) -> bool:
+        return self._queue.empty()
 
 
 def to_mono_16k(samples: np.ndarray, source_rate: int, channels: int) -> np.ndarray:
@@ -88,7 +121,7 @@ class TranscriptStore:
         self.folder.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
         self.path = folder / f"逐字稿_{stamp}.txt"
-        self.path.write_text("電腦聲音逐字稿\n\n", encoding="utf-8")
+        self.path.write_text("聲音逐字稿\n\n", encoding="utf-8")
 
     def append(self, line: TranscriptLine) -> None:
         with self.path.open("a", encoding="utf-8") as handle:

@@ -11,6 +11,7 @@ from tkinter import filedialog, messagebox, ttk
 import numpy as np
 
 from transcript_core import (
+    AudioChunkBuffer,
     RECORDING_MODES,
     TranscriptLine,
     TranscriptStore,
@@ -75,11 +76,63 @@ class TranscriptionWorker:
         self.events = events
         self.stop_event = stop_event
 
+    def _capture_source(
+        self,
+        source: str,
+        device: dict,
+        started: float,
+        chunks: AudioChunkBuffer,
+        errors: queue.Queue,
+        audio_library=None,
+    ) -> None:
+        pyaudio = audio_library or load_audio_library()
+        audio = stream = None
+        try:
+            audio = pyaudio.PyAudio()
+            rate = int(device["defaultSampleRate"])
+            channels = int(device["maxInputChannels"])
+            frames = 2048
+            stream = audio.open(
+                format=pyaudio.paInt16,
+                channels=channels,
+                rate=rate,
+                input=True,
+                input_device_index=int(device["index"]),
+                frames_per_buffer=frames,
+            )
+            target = rate * channels * 5
+            pending: list[np.ndarray] = []
+            pending_count = 0
+            while not self.stop_event.is_set():
+                raw = stream.read(frames, exception_on_overflow=False)
+                block = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                pending.append(block)
+                pending_count += block.size
+                if pending_count < target:
+                    continue
+                chunk = to_mono_16k(np.concatenate(pending), rate, channels)
+                pending.clear()
+                pending_count = 0
+                if not is_speech(chunk):
+                    self.events.put(("level", f"{source}：略過靜音片段"))
+                    continue
+                elapsed = time.monotonic() - started
+                if not chunks.submit(source, elapsed, chunk):
+                    self.events.put(("level", f"{source}：辨識速度落後，略過一段音訊"))
+        except Exception as exc:
+            errors.put((source, exc))
+            self.stop_event.set()
+        finally:
+            if stream is not None:
+                stream.stop_stream()
+                stream.close()
+            if audio is not None:
+                audio.terminate()
+
     def run(self, devices: dict[str, dict], model_name: str, language: str | None) -> None:
-        streams: dict[str, object] = {}
-        audio = None
         started = time.monotonic()
         store = TranscriptStore(TRANSCRIPT_DIR)
+        capture_threads: list[threading.Thread] = []
         try:
             self.events.put(("status", f"載入 {model_name} 模型（首次使用會下載）…"))
             from faster_whisper import WhisperModel
@@ -91,75 +144,55 @@ class TranscriptionWorker:
                 model = WhisperModel(model_name, device="cpu", compute_type="int8")
                 engine = "CPU"
 
-            pyaudio = load_audio_library()
-            audio = pyaudio.PyAudio()
-            frames = 2048
-            states: dict[str, dict] = {}
+            chunks = AudioChunkBuffer(maxsize=12)
+            capture_errors: queue.Queue = queue.Queue()
             for source, device in devices.items():
-                rate = int(device["defaultSampleRate"])
-                channels = int(device["maxInputChannels"])
-                streams[source] = audio.open(
-                    format=pyaudio.paInt16,
-                    channels=channels,
-                    rate=rate,
-                    input=True,
-                    input_device_index=int(device["index"]),
-                    frames_per_buffer=frames,
+                thread = threading.Thread(
+                    target=self._capture_source,
+                    args=(source, device, started, chunks, capture_errors),
+                    name=f"capture-{source}",
+                    daemon=True,
                 )
-                states[source] = {
-                    "rate": rate,
-                    "channels": channels,
-                    "target": rate * channels * 5,
-                    "pending": [],
-                    "count": 0,
-                }
+                capture_threads.append(thread)
+                thread.start()
             source_names = "＋".join(devices)
             self.events.put(("started", f"監聽中 · {engine} · {source_names}", str(store.path)))
 
-            while not self.stop_event.is_set():
-                for source, stream in streams.items():
-                    state = states[source]
-                    raw = stream.read(frames, exception_on_overflow=False)
-                    block = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-                    state["pending"].append(block)
-                    state["count"] += block.size
-                    if state["count"] < state["target"]:
-                        continue
-                    chunk = to_mono_16k(
-                        np.concatenate(state["pending"]),
-                        state["rate"],
-                        state["channels"],
-                    )
-                    state["pending"].clear()
-                    state["count"] = 0
-                    if not is_speech(chunk):
-                        self.events.put(("level", f"{source}：略過靜音片段"))
-                        continue
-                    self.events.put(("level", f"正在辨識{source}聲音…"))
-                    try:
-                        text = transcribe_chunk(model, chunk, language)
-                    except Exception as exc:
-                        if engine != "NVIDIA GPU" or not is_cuda_runtime_error(exc):
-                            raise
-                        self.events.put(("level", "CUDA 元件不完整，正在自動切換至 CPU…"))
-                        del model
-                        model = WhisperModel(model_name, device="cpu", compute_type="int8")
-                        engine = "CPU"
-                        text = transcribe_chunk(model, chunk, language)
-                        self.events.put(("engine", f"已切換至 CPU · {source_names}"))
-                    if text:
-                        line = TranscriptLine(time.monotonic() - started, text, source)
-                        store.append(line)
-                        self.events.put(("text", line.render()))
-                    self.events.put(("level", "等待語音…"))
+            while (
+                any(thread.is_alive() for thread in capture_threads)
+                or not chunks.empty()
+                or not capture_errors.empty()
+            ):
+                if not capture_errors.empty():
+                    source, error = capture_errors.get_nowait()
+                    raise RuntimeError(f"{source}音訊擷取失敗：{error}") from error
+                try:
+                    captured = chunks.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                self.events.put(("level", f"正在辨識{captured.source}聲音…"))
+                try:
+                    text = transcribe_chunk(model, captured.audio, language)
+                except Exception as exc:
+                    if engine != "NVIDIA GPU" or not is_cuda_runtime_error(exc):
+                        raise
+                    self.events.put(("level", "CUDA 元件不完整，正在自動切換至 CPU…"))
+                    del model
+                    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+                    engine = "CPU"
+                    text = transcribe_chunk(model, captured.audio, language)
+                    self.events.put(("engine", f"已切換至 CPU · {source_names}"))
+                if text:
+                    line = TranscriptLine(captured.elapsed, text, captured.source)
+                    store.append(line)
+                    self.events.put(("text", line.render()))
+                self.events.put(("level", "等待語音…"))
         except Exception as exc:
             self.events.put(("error", str(exc)))
         finally:
-            for stream in streams.values():
-                stream.stop_stream()
-                stream.close()
-            if audio is not None:
-                audio.terminate()
+            self.stop_event.set()
+            for thread in capture_threads:
+                thread.join(timeout=2)
             self.events.put(("stopped",))
 
 
