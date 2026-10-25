@@ -39,6 +39,18 @@ def split_audio_devices(devices: list[dict]) -> tuple[list[dict], list[dict]]:
     return system, microphones
 
 
+def discover_wasapi_devices(devices: list[dict]) -> tuple[list[dict], list[dict]]:
+    wasapi_hosts = {
+        int(item.get("hostApi", -1))
+        for item in devices
+        if bool(item.get("isLoopbackDevice"))
+    }
+    wasapi_devices = [
+        item for item in devices if int(item.get("hostApi", -1)) in wasapi_hosts
+    ]
+    return split_audio_devices(wasapi_devices)
+
+
 def prefer_default_device(devices: list[dict], default_index: int) -> list[dict]:
     return sorted(devices, key=lambda item: int(item.get("index", -1)) != int(default_index))
 
@@ -47,6 +59,17 @@ def order_audio_devices(
     system: list[dict], microphones: list[dict], default_input_index: int
 ) -> tuple[list[dict], list[dict]]:
     return system, prefer_default_device(microphones, default_input_index)
+
+
+def prefer_physical_microphones(microphones: list[dict]) -> list[dict]:
+    virtual_markers = ("virtual", "虛擬")
+    return sorted(
+        microphones,
+        key=lambda item: any(
+            marker in str(item.get("name", "")).casefold()
+            for marker in virtual_markers
+        ),
+    )
 
 
 @dataclass(order=True, frozen=True)

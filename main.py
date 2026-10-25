@@ -17,10 +17,10 @@ from transcript_core import (
     TranscriptStore,
     active_sources,
     clean_text,
+    discover_wasapi_devices,
     device_states,
     is_speech,
-    order_audio_devices,
-    split_audio_devices,
+    prefer_physical_microphones,
     to_mono_16k,
 )
 
@@ -61,18 +61,12 @@ def list_audio_devices() -> tuple[list[dict], list[dict]]:
     pyaudio = load_audio_library()
     audio = pyaudio.PyAudio()
     try:
-        wasapi = audio.get_host_api_info_by_type(pyaudio.paWASAPI)
         devices = [
             dict(audio.get_device_info_by_index(index))
             for index in range(audio.get_device_count())
         ]
-        wasapi_devices = [item for item in devices if int(item.get("hostApi", -1)) == int(wasapi["index"])]
-        system, microphones = split_audio_devices(wasapi_devices)
-        return order_audio_devices(
-            system,
-            microphones,
-            default_input_index=int(wasapi.get("defaultInputDevice", -1)),
-        )
+        system, microphones = discover_wasapi_devices(devices)
+        return system, prefer_physical_microphones(microphones)
     finally:
         audio.terminate()
 

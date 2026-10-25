@@ -64,6 +64,19 @@ class TranscriptCoreTests(unittest.TestCase):
         self.assertEqual([item["index"] for item in system], [1])
         self.assertEqual([item["index"] for item in microphones], [2])
 
+    def test_wasapi_devices_are_discovered_from_loopback_host(self):
+        self.assertTrue(hasattr(transcript_core, "discover_wasapi_devices"), "缺少安全 WASAPI 探索")
+        devices = [
+            {"index": 1, "hostApi": 0, "maxInputChannels": 1, "isLoopbackDevice": False},
+            {"index": 2, "hostApi": 2, "maxInputChannels": 2, "isLoopbackDevice": True},
+            {"index": 3, "hostApi": 2, "maxInputChannels": 1, "isLoopbackDevice": False},
+        ]
+
+        system, microphones = transcript_core.discover_wasapi_devices(devices)
+
+        self.assertEqual([item["index"] for item in system], [2])
+        self.assertEqual([item["index"] for item in microphones], [3])
+
     def test_windows_default_audio_device_is_selected_first(self):
         self.assertTrue(hasattr(transcript_core, "prefer_default_device"), "缺少預設裝置排序")
         devices = [
@@ -86,6 +99,17 @@ class TranscriptCoreTests(unittest.TestCase):
 
         self.assertEqual([item["index"] for item in ordered_system], [24, 22])
         self.assertEqual([item["index"] for item in ordered_microphones], [21, 20])
+
+    def test_physical_microphone_is_preferred_without_default_device_query(self):
+        self.assertTrue(hasattr(transcript_core, "prefer_physical_microphones"), "缺少實體麥克風排序")
+        microphones = [
+            {"index": 20, "name": "DeskIn(R) Virtual Audio Device"},
+            {"index": 21, "name": "Microphone (High Definition Audio Device)"},
+        ]
+
+        ordered = transcript_core.prefer_physical_microphones(microphones)
+
+        self.assertEqual([item["index"] for item in ordered], [21, 20])
 
     def test_capture_buffer_keeps_capture_independent_and_orders_by_capture_time(self):
         self.assertTrue(hasattr(transcript_core, "AudioChunkBuffer"), "缺少非同步音訊緩衝")
