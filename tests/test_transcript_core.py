@@ -75,6 +75,18 @@ class TranscriptCoreTests(unittest.TestCase):
 
         self.assertEqual([item["index"] for item in ordered], [21, 20])
 
+    def test_device_ordering_only_prioritizes_safe_default_microphone(self):
+        self.assertTrue(hasattr(transcript_core, "order_audio_devices"), "缺少安全裝置排序")
+        system = [{"index": 24}, {"index": 22}]
+        microphones = [{"index": 20}, {"index": 21}]
+
+        ordered_system, ordered_microphones = transcript_core.order_audio_devices(
+            system, microphones, default_input_index=21
+        )
+
+        self.assertEqual([item["index"] for item in ordered_system], [24, 22])
+        self.assertEqual([item["index"] for item in ordered_microphones], [21, 20])
+
     def test_capture_buffer_keeps_capture_independent_and_orders_by_capture_time(self):
         self.assertTrue(hasattr(transcript_core, "AudioChunkBuffer"), "缺少非同步音訊緩衝")
         buffer = transcript_core.AudioChunkBuffer(maxsize=8)

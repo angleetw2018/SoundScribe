@@ -19,7 +19,7 @@ from transcript_core import (
     clean_text,
     device_states,
     is_speech,
-    prefer_default_device,
+    order_audio_devices,
     split_audio_devices,
     to_mono_16k,
 )
@@ -68,14 +68,10 @@ def list_audio_devices() -> tuple[list[dict], list[dict]]:
         ]
         wasapi_devices = [item for item in devices if int(item.get("hostApi", -1)) == int(wasapi["index"])]
         system, microphones = split_audio_devices(wasapi_devices)
-        default_input = int(wasapi.get("defaultInputDevice", -1))
-        try:
-            default_loopback = int(audio.get_default_wasapi_loopback()["index"])
-        except OSError:
-            default_loopback = -1
-        return (
-            prefer_default_device(system, default_loopback),
-            prefer_default_device(microphones, default_input),
+        return order_audio_devices(
+            system,
+            microphones,
+            default_input_index=int(wasapi.get("defaultInputDevice", -1)),
         )
     finally:
         audio.terminate()
