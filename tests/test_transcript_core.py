@@ -64,6 +64,17 @@ class TranscriptCoreTests(unittest.TestCase):
         self.assertEqual([item["index"] for item in system], [1])
         self.assertEqual([item["index"] for item in microphones], [2])
 
+    def test_windows_default_audio_device_is_selected_first(self):
+        self.assertTrue(hasattr(transcript_core, "prefer_default_device"), "缺少預設裝置排序")
+        devices = [
+            {"index": 20, "name": "Virtual microphone"},
+            {"index": 21, "name": "Physical microphone"},
+        ]
+
+        ordered = transcript_core.prefer_default_device(devices, 21)
+
+        self.assertEqual([item["index"] for item in ordered], [21, 20])
+
     def test_capture_buffer_keeps_capture_independent_and_orders_by_capture_time(self):
         self.assertTrue(hasattr(transcript_core, "AudioChunkBuffer"), "缺少非同步音訊緩衝")
         buffer = transcript_core.AudioChunkBuffer(maxsize=8)

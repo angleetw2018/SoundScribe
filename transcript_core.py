@@ -39,6 +39,10 @@ def split_audio_devices(devices: list[dict]) -> tuple[list[dict], list[dict]]:
     return system, microphones
 
 
+def prefer_default_device(devices: list[dict], default_index: int) -> list[dict]:
+    return sorted(devices, key=lambda item: int(item.get("index", -1)) != int(default_index))
+
+
 @dataclass(order=True, frozen=True)
 class AudioChunk:
     elapsed: float
