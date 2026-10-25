@@ -17,10 +17,8 @@ from transcript_core import (
     TranscriptStore,
     active_sources,
     clean_text,
-    discover_wasapi_devices,
     device_states,
     is_speech,
-    prefer_physical_microphones,
     to_mono_16k,
 )
 
@@ -29,6 +27,25 @@ APP_DIR = Path(__file__).resolve().parent
 TRANSCRIPT_DIR = APP_DIR / "transcripts"
 MODELS = ("tiny", "base", "small", "medium", "large-v3", "turbo")
 LANGUAGES = {"自動偵測": None, "繁體中文／中文": "zh", "英文": "en", "日文": "ja", "韓文": "ko"}
+
+
+class _SoundcardNumpyCompat:
+    def __init__(self, numpy_module) -> None:
+        self._numpy = numpy_module
+
+    def __getattr__(self, name):
+        return getattr(self._numpy, name)
+
+    def fromstring(self, data, dtype=float, count=-1, sep=""):
+        if sep:
+            return self._numpy.fromstring(data, dtype=dtype, count=count, sep=sep)
+        return self._numpy.frombuffer(data, dtype=dtype, count=count)
+
+
+def make_soundcard_numpy_compatible(soundcard_module) -> None:
+    backend = getattr(soundcard_module, "mediafoundation", None)
+    if backend is not None and not isinstance(backend.numpy, _SoundcardNumpyCompat):
+        backend.numpy = _SoundcardNumpyCompat(backend.numpy)
 
 
 def is_cuda_runtime_error(error: BaseException) -> bool:
@@ -51,30 +68,122 @@ def transcribe_chunk(model, chunk: np.ndarray, language: str | None) -> str:
 
 def load_audio_library():
     try:
-        import pyaudiowpatch as pyaudio
+        import soundcard
     except ImportError as exc:
-        raise RuntimeError("尚未安裝 PyAudioWPatch，請先執行 install.bat。") from exc
-    return pyaudio
+        raise RuntimeError("尚未安裝 soundcard，請先執行 install.bat。") from exc
+    make_soundcard_numpy_compatible(soundcard)
+    return soundcard
 
 
-def list_audio_devices() -> tuple[list[dict], list[dict]]:
-    pyaudio = load_audio_library()
-    audio = pyaudio.PyAudio()
+def load_microphone_library():
     try:
-        devices = [
-            dict(audio.get_device_info_by_index(index))
-            for index in range(audio.get_device_count())
-        ]
-        system, microphones = discover_wasapi_devices(devices)
-        return system, prefer_physical_microphones(microphones)
-    finally:
-        audio.terminate()
+        import miniaudio
+    except ImportError as exc:
+        raise RuntimeError("尚未安裝 miniaudio，請先執行 install.bat。") from exc
+    return miniaudio
+
+
+def list_audio_devices(audio_library=None, microphone_library=None) -> tuple[list[dict], list[dict]]:
+    soundcard = audio_library or load_audio_library()
+    miniaudio = microphone_library or load_microphone_library()
+    system = [
+        {"id": speaker.id, "name": speaker.name, "kind": "loopback"}
+        for speaker in soundcard.all_speakers()
+    ]
+    microphones = [
+        {"id": microphone["id"], "name": microphone["name"], "kind": "microphone"}
+        for microphone in miniaudio.Devices([miniaudio.Backend.WASAPI]).get_captures()
+    ]
+    virtual_markers = ("virtual", "虛擬")
+    microphones.sort(
+        key=lambda item: any(marker in item["name"].casefold() for marker in virtual_markers)
+    )
+    return system, microphones
 
 
 class TranscriptionWorker:
     def __init__(self, events: queue.Queue, stop_event: threading.Event) -> None:
         self.events = events
         self.stop_event = stop_event
+
+    def _submit_captured_audio(
+        self, source: str, started: float, audio: np.ndarray, chunks: AudioChunkBuffer
+    ) -> None:
+        chunk = to_mono_16k(audio, 48_000, 1)
+        if not is_speech(chunk):
+            self.events.put(("level", f"{source}：略過靜音片段"))
+            return
+        elapsed = time.monotonic() - started
+        if not chunks.submit(source, elapsed, chunk):
+            self.events.put(("level", f"{source}：辨識速度落後，略過一段音訊"))
+
+    def _capture_loopback(
+        self, source: str, device: dict, started: float, chunks: AudioChunkBuffer, soundcard
+    ) -> None:
+        rate = 48_000
+        frames = 2048
+        microphone = soundcard.get_microphone(device["id"], include_loopback=True)
+        with microphone.recorder(samplerate=rate, channels=None, blocksize=frames) as recorder:
+            target_frames = rate * 5
+            pending: list[np.ndarray] = []
+            pending_frames = 0
+            while not self.stop_event.is_set():
+                block = np.asarray(recorder.record(numframes=frames), dtype=np.float32)
+                if block.ndim == 1:
+                    block = block.reshape(-1, 1)
+                pending.append(block)
+                pending_frames += block.shape[0]
+                if pending_frames < target_frames:
+                    continue
+                captured = np.concatenate(pending, axis=0)
+                mono = captured.mean(axis=1, dtype=np.float32)
+                pending.clear()
+                pending_frames = 0
+                self._submit_captured_audio(source, started, mono, chunks)
+
+    def _capture_microphone(
+        self, source: str, device: dict, started: float, chunks: AudioChunkBuffer, miniaudio
+    ) -> None:
+        pending: list[np.ndarray] = []
+        pending_samples = 0
+        target_samples = 48_000 * 5
+
+        def receive_audio():
+            nonlocal pending_samples
+            while True:
+                raw = yield
+                block = np.frombuffer(raw, dtype=np.float32).copy()
+                pending.append(block)
+                pending_samples += block.size
+                if pending_samples < target_samples:
+                    continue
+                captured = np.concatenate(pending)
+                pending.clear()
+                pending_samples = 0
+                self._submit_captured_audio(source, started, captured, chunks)
+
+        callback = receive_audio()
+        next(callback)
+        recorder = miniaudio.CaptureDevice(
+            input_format=miniaudio.SampleFormat.FLOAT32,
+            nchannels=1,
+            sample_rate=48_000,
+            buffersize_msec=50,
+            device_id=device["id"],
+            backends=[miniaudio.Backend.WASAPI],
+        )
+        device_stopped = threading.Event()
+        recorder.stop_callback = device_stopped.set
+        try:
+            recorder.start(callback)
+            while not self.stop_event.is_set():
+                if device_stopped.wait(timeout=0.1) or not recorder.running:
+                    raise RuntimeError("麥克風已中斷或被停用")
+        finally:
+            recorder.stop_callback = None
+            recorder.stop()
+            recorder.close()
+            callback.close()
 
     def _capture_source(
         self,
@@ -85,49 +194,18 @@ class TranscriptionWorker:
         errors: queue.Queue,
         audio_library=None,
     ) -> None:
-        pyaudio = audio_library or load_audio_library()
-        audio = stream = None
         try:
-            audio = pyaudio.PyAudio()
-            rate = int(device["defaultSampleRate"])
-            channels = int(device["maxInputChannels"])
-            frames = 2048
-            stream = audio.open(
-                format=pyaudio.paInt16,
-                channels=channels,
-                rate=rate,
-                input=True,
-                input_device_index=int(device["index"]),
-                frames_per_buffer=frames,
-            )
-            target = rate * channels * 5
-            pending: list[np.ndarray] = []
-            pending_count = 0
-            while not self.stop_event.is_set():
-                raw = stream.read(frames, exception_on_overflow=False)
-                block = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-                pending.append(block)
-                pending_count += block.size
-                if pending_count < target:
-                    continue
-                chunk = to_mono_16k(np.concatenate(pending), rate, channels)
-                pending.clear()
-                pending_count = 0
-                if not is_speech(chunk):
-                    self.events.put(("level", f"{source}：略過靜音片段"))
-                    continue
-                elapsed = time.monotonic() - started
-                if not chunks.submit(source, elapsed, chunk):
-                    self.events.put(("level", f"{source}：辨識速度落後，略過一段音訊"))
+            if device["kind"] == "loopback":
+                soundcard = audio_library or load_audio_library()
+                if isinstance(soundcard, tuple):
+                    soundcard = soundcard[0]
+                self._capture_loopback(source, device, started, chunks, soundcard)
+            else:
+                miniaudio = audio_library[1] if isinstance(audio_library, tuple) else load_microphone_library()
+                self._capture_microphone(source, device, started, chunks, miniaudio)
         except Exception as exc:
             errors.put((source, exc))
             self.stop_event.set()
-        finally:
-            if stream is not None:
-                stream.stop_stream()
-                stream.close()
-            if audio is not None:
-                audio.terminate()
 
     def _next_chunk(self, chunks: AudioChunkBuffer, capture_errors: queue.Queue):
         def raise_capture_error_if_present() -> None:

@@ -9,10 +9,29 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import transcript_core
 from transcript_core import TranscriptLine, clean_text, format_timestamp, is_speech, to_mono_16k
-from main import TranscriptionWorker, is_cuda_runtime_error
+from main import (
+    TranscriptionWorker,
+    is_cuda_runtime_error,
+    list_audio_devices,
+    make_soundcard_numpy_compatible,
+)
 
 
 class TranscriptCoreTests(unittest.TestCase):
+    def test_soundcard_binary_fromstring_remains_compatible_with_numpy_2_3(self):
+        class Backend:
+            numpy = np
+
+        class FakeSoundcard:
+            mediafoundation = Backend()
+
+        make_soundcard_numpy_compatible(FakeSoundcard)
+
+        result = FakeSoundcard.mediafoundation.numpy.fromstring(
+            np.array([0.25, -0.5], dtype=np.float32).tobytes(), dtype=np.float32
+        )
+        np.testing.assert_allclose(result, [0.25, -0.5])
+
     def test_stereo_to_mono(self):
         result = to_mono_16k(np.array([1.0, -1.0, 0.5, 0.5], dtype=np.float32), 16000, 2)
         np.testing.assert_allclose(result, [0.0, 0.5])
@@ -53,64 +72,6 @@ class TranscriptCoreTests(unittest.TestCase):
         line = TranscriptLine(5.9, "可以聽到嗎？", "麥克風")
         self.assertEqual(line.render(), "[00:00:05] [麥克風] 可以聽到嗎？")
 
-    def test_audio_devices_are_split_into_system_and_microphone(self):
-        self.assertTrue(hasattr(transcript_core, "split_audio_devices"), "缺少音訊裝置分類")
-        devices = [
-            {"index": 1, "name": "Speakers [Loopback]", "maxInputChannels": 2, "isLoopbackDevice": True},
-            {"index": 2, "name": "USB Microphone", "maxInputChannels": 1, "isLoopbackDevice": False},
-            {"index": 3, "name": "Disabled", "maxInputChannels": 0, "isLoopbackDevice": False},
-        ]
-        system, microphones = transcript_core.split_audio_devices(devices)
-        self.assertEqual([item["index"] for item in system], [1])
-        self.assertEqual([item["index"] for item in microphones], [2])
-
-    def test_wasapi_devices_are_discovered_from_loopback_host(self):
-        self.assertTrue(hasattr(transcript_core, "discover_wasapi_devices"), "缺少安全 WASAPI 探索")
-        devices = [
-            {"index": 1, "hostApi": 0, "maxInputChannels": 1, "isLoopbackDevice": False},
-            {"index": 2, "hostApi": 2, "maxInputChannels": 2, "isLoopbackDevice": True},
-            {"index": 3, "hostApi": 2, "maxInputChannels": 1, "isLoopbackDevice": False},
-        ]
-
-        system, microphones = transcript_core.discover_wasapi_devices(devices)
-
-        self.assertEqual([item["index"] for item in system], [2])
-        self.assertEqual([item["index"] for item in microphones], [3])
-
-    def test_windows_default_audio_device_is_selected_first(self):
-        self.assertTrue(hasattr(transcript_core, "prefer_default_device"), "缺少預設裝置排序")
-        devices = [
-            {"index": 20, "name": "Virtual microphone"},
-            {"index": 21, "name": "Physical microphone"},
-        ]
-
-        ordered = transcript_core.prefer_default_device(devices, 21)
-
-        self.assertEqual([item["index"] for item in ordered], [21, 20])
-
-    def test_device_ordering_only_prioritizes_safe_default_microphone(self):
-        self.assertTrue(hasattr(transcript_core, "order_audio_devices"), "缺少安全裝置排序")
-        system = [{"index": 24}, {"index": 22}]
-        microphones = [{"index": 20}, {"index": 21}]
-
-        ordered_system, ordered_microphones = transcript_core.order_audio_devices(
-            system, microphones, default_input_index=21
-        )
-
-        self.assertEqual([item["index"] for item in ordered_system], [24, 22])
-        self.assertEqual([item["index"] for item in ordered_microphones], [21, 20])
-
-    def test_physical_microphone_is_preferred_without_default_device_query(self):
-        self.assertTrue(hasattr(transcript_core, "prefer_physical_microphones"), "缺少實體麥克風排序")
-        microphones = [
-            {"index": 20, "name": "DeskIn(R) Virtual Audio Device"},
-            {"index": 21, "name": "Microphone (High Definition Audio Device)"},
-        ]
-
-        ordered = transcript_core.prefer_physical_microphones(microphones)
-
-        self.assertEqual([item["index"] for item in ordered], [21, 20])
-
     def test_capture_buffer_keeps_capture_independent_and_orders_by_capture_time(self):
         self.assertTrue(hasattr(transcript_core, "AudioChunkBuffer"), "缺少非同步音訊緩衝")
         buffer = transcript_core.AudioChunkBuffer(maxsize=8)
@@ -128,50 +89,169 @@ class TranscriptCoreTests(unittest.TestCase):
         self.assertEqual(buffer.get_nowait().source, "麥克風")
         self.assertEqual(buffer.get_nowait().source, "電腦")
 
-    def test_capture_worker_drains_stream_into_buffer_without_transcribing(self):
+    def test_soundcard_devices_are_listed_as_loopback_and_microphone_sources(self):
+        test_case = self
+
+        class FakeDevice:
+            def __init__(self, identifier, name):
+                self.id = identifier
+                self.name = name
+
+        class FakeSoundcard:
+            @staticmethod
+            def all_speakers():
+                return [FakeDevice("speaker-1", "Speakers")]
+
+        class FakeDevices:
+            def __init__(self, backends):
+                test_case.assertEqual(backends, [FakeMiniaudio.Backend.WASAPI])
+
+            def get_captures(self):
+                return [{"id": "mic-1", "name": "USB Microphone"}]
+
+        class FakeMiniaudio:
+            class Backend:
+                WASAPI = "wasapi"
+
+            Devices = FakeDevices
+
+        system, microphones = list_audio_devices(FakeSoundcard, FakeMiniaudio)
+
+        self.assertEqual(system, [{"id": "speaker-1", "name": "Speakers", "kind": "loopback"}])
+        self.assertEqual(microphones, [{"id": "mic-1", "name": "USB Microphone", "kind": "microphone"}])
+
+    def test_capture_worker_drains_soundcard_loopback_into_buffer_without_transcribing(self):
         self.assertTrue(hasattr(TranscriptionWorker, "_capture_source"), "缺少獨立擷取工作")
         stop_event = threading.Event()
         events = __import__("queue").Queue()
         chunks = transcript_core.AudioChunkBuffer(maxsize=2)
         errors = __import__("queue").Queue()
+        test_case = self
 
-        class FakeStream:
-            def read(self, _frames, exception_on_overflow=False):
-                stop_event.set()
-                return np.full(8, 5000, dtype=np.int16).tobytes()
+        class FakeRecorder:
+            def __enter__(self):
+                return self
 
-            def stop_stream(self):
+            def __exit__(self, *_args):
                 pass
+
+            def record(self, numframes):
+                test_case.assertEqual(numframes, 2048)
+                stop_event.set()
+                return np.full((240_000, 1), 0.25, dtype=np.float32)
+
+        class FakeMicrophone:
+            def recorder(self, samplerate, channels=None, blocksize=None):
+                test_case.assertEqual(samplerate, 48_000)
+                test_case.assertIsNone(channels)
+                test_case.assertEqual(blocksize, 2048)
+                return FakeRecorder()
+
+        class FakeSoundcard:
+            @staticmethod
+            def get_microphone(identifier, include_loopback=False):
+                self.assertEqual(identifier, "speaker-1")
+                self.assertTrue(include_loopback)
+                return FakeMicrophone()
+
+        worker = TranscriptionWorker(events, stop_event)
+        worker._capture_source(
+            "電腦",
+            {"id": "speaker-1", "name": "Speakers", "kind": "loopback"},
+            time.monotonic(),
+            chunks,
+            errors,
+            FakeSoundcard,
+        )
+
+        self.assertTrue(errors.empty())
+        self.assertEqual(chunks.get_nowait().source, "電腦")
+
+    def test_capture_worker_uses_miniaudio_for_physical_microphone(self):
+        import queue
+
+        stop_event = threading.Event()
+        chunks = transcript_core.AudioChunkBuffer(maxsize=2)
+        errors = queue.Queue()
+
+        class FakeCaptureDevice:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.running = False
+                self.stop_callback = None
+
+            def start(self, callback):
+                self.running = True
+                callback.send(np.full(240_000, 0.25, dtype=np.float32).tobytes())
+                stop_event.set()
+
+            def stop(self):
+                self.running = False
 
             def close(self):
                 pass
 
-        class FakeAudio:
-            def open(self, **_kwargs):
-                return FakeStream()
+        class FakeMiniaudio:
+            class SampleFormat:
+                FLOAT32 = "float32"
 
-            def terminate(self):
-                pass
+            class Backend:
+                WASAPI = "wasapi"
 
-        class FakePyAudio:
-            paInt16 = 8
+            CaptureDevice = FakeCaptureDevice
 
-            @staticmethod
-            def PyAudio():
-                return FakeAudio()
-
-        worker = TranscriptionWorker(events, stop_event)
+        worker = TranscriptionWorker(queue.Queue(), stop_event)
         worker._capture_source(
             "麥克風",
-            {"index": 1, "defaultSampleRate": 1, "maxInputChannels": 1},
-            time.monotonic(),
-            chunks,
-            errors,
-            FakePyAudio,
+            {"id": "mic-1", "name": "USB Microphone", "kind": "microphone"},
+            time.monotonic(), chunks, errors, (None, FakeMiniaudio),
         )
 
         self.assertTrue(errors.empty())
         self.assertEqual(chunks.get_nowait().source, "麥克風")
+
+    def test_microphone_disconnect_is_reported_instead_of_waiting_forever(self):
+        import queue
+
+        stop_event = threading.Event()
+        errors = queue.Queue()
+
+        class DisconnectingDevice:
+            def __init__(self, **_kwargs):
+                self.running = False
+                self.stop_callback = None
+
+            def start(self, _callback):
+                self.running = True
+                self.running = False
+                self.stop_callback()
+
+            def stop(self):
+                self.running = False
+
+            def close(self):
+                pass
+
+        class FakeMiniaudio:
+            class SampleFormat:
+                FLOAT32 = "float32"
+
+            class Backend:
+                WASAPI = "wasapi"
+
+            CaptureDevice = DisconnectingDevice
+
+        worker = TranscriptionWorker(queue.Queue(), stop_event)
+        worker._capture_source(
+            "麥克風",
+            {"id": "mic-1", "name": "USB Microphone", "kind": "microphone"},
+            time.monotonic(), transcript_core.AudioChunkBuffer(), errors,
+            (None, FakeMiniaudio),
+        )
+
+        source, error = errors.get_nowait()
+        self.assertEqual(source, "麥克風")
+        self.assertRegex(str(error), "麥克風已中斷")
 
     def test_stop_request_does_not_drain_queued_transcription_backlog(self):
         self.assertTrue(hasattr(TranscriptionWorker, "_next_chunk"), "停止後仍會處理積壓音訊")
