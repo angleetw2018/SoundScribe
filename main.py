@@ -48,10 +48,12 @@ def make_soundcard_numpy_compatible(soundcard_module) -> None:
         backend.numpy = _SoundcardNumpyCompat(backend.numpy)
 
 
-def is_cuda_runtime_error(error: BaseException) -> bool:
-    message = str(error).lower()
-    markers = ("cuda", "cublas", "cudnn", "nvrtc", "nvcuda")
-    return any(marker in message for marker in markers)
+def load_whisper_model(model_name: str, model_class=None):
+    if model_class is None:
+        from faster_whisper import WhisperModel
+
+        model_class = WhisperModel
+    return model_class(model_name, device="cpu", compute_type="int8"), "CPU"
 
 
 def transcribe_chunk(model, chunk: np.ndarray, language: str | None) -> str:
@@ -232,14 +234,7 @@ class TranscriptionWorker:
         capture_threads: list[threading.Thread] = []
         try:
             self.events.put(("status", f"載入 {model_name} 模型（首次使用會下載）…"))
-            from faster_whisper import WhisperModel
-
-            try:
-                model = WhisperModel(model_name, device="cuda", compute_type="float16")
-                engine = "NVIDIA GPU"
-            except Exception:
-                model = WhisperModel(model_name, device="cpu", compute_type="int8")
-                engine = "CPU"
+            model, engine = load_whisper_model(model_name)
 
             chunks = AudioChunkBuffer(maxsize=12)
             capture_errors: queue.Queue = queue.Queue()
@@ -266,17 +261,7 @@ class TranscriptionWorker:
                         break
                     continue
                 self.events.put(("level", f"正在辨識{captured.source}聲音…"))
-                try:
-                    text = transcribe_chunk(model, captured.audio, language)
-                except Exception as exc:
-                    if engine != "NVIDIA GPU" or not is_cuda_runtime_error(exc):
-                        raise
-                    self.events.put(("level", "CUDA 元件不完整，正在自動切換至 CPU…"))
-                    del model
-                    model = WhisperModel(model_name, device="cpu", compute_type="int8")
-                    engine = "CPU"
-                    text = transcribe_chunk(model, captured.audio, language)
-                    self.events.put(("engine", f"已切換至 CPU · {source_names}"))
+                text = transcribe_chunk(model, captured.audio, language)
                 if text:
                     line = TranscriptLine(captured.elapsed, text, captured.source)
                     store.append(line)

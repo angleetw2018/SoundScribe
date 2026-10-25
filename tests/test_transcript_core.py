@@ -8,16 +8,29 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import transcript_core
+import main
 from transcript_core import TranscriptLine, clean_text, format_timestamp, is_speech, to_mono_16k
 from main import (
     TranscriptionWorker,
-    is_cuda_runtime_error,
     list_audio_devices,
     make_soundcard_numpy_compatible,
 )
 
 
 class TranscriptCoreTests(unittest.TestCase):
+    def test_whisper_model_defaults_to_cpu_int8(self):
+        calls = []
+
+        class FakeWhisperModel:
+            def __init__(self, model_name, **options):
+                calls.append((model_name, options))
+
+        self.assertTrue(hasattr(main, "load_whisper_model"), "缺少 CPU 模型載入策略")
+        _model, engine = main.load_whisper_model("small", FakeWhisperModel)
+
+        self.assertEqual(calls, [("small", {"device": "cpu", "compute_type": "int8"})])
+        self.assertEqual(engine, "CPU")
+
     def test_soundcard_binary_fromstring_remains_compatible_with_numpy_2_3(self):
         class Backend:
             numpy = np
@@ -47,11 +60,6 @@ class TranscriptCoreTests(unittest.TestCase):
     def test_formatting(self):
         self.assertEqual(format_timestamp(3661.9), "01:01:01")
         self.assertEqual(clean_text("  你好  \n 世界 "), "你好 世界")
-
-    def test_cuda_runtime_error_detection(self):
-        self.assertTrue(is_cuda_runtime_error(RuntimeError("Library cublas64_12.dll is not found")))
-        self.assertTrue(is_cuda_runtime_error(RuntimeError("cuDNN failed to initialize")))
-        self.assertFalse(is_cuda_runtime_error(RuntimeError("audio device disconnected")))
 
     def test_recording_modes_select_expected_sources(self):
         self.assertTrue(hasattr(transcript_core, "active_sources"), "缺少錄音模式來源選擇")

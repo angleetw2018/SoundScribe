@@ -18,7 +18,7 @@ Windows 10/11 本機電腦聲音與麥克風逐字稿工具。它透過 SoundCar
 
 同時錄製兩個來源時建議戴耳機，避免麥克風再次收到喇叭聲而產生重複文字。
 
-第一次使用某個模型時會自動下載。CPU 建議先用 `small`；有 NVIDIA GPU 可嘗試 `turbo` 或 `large-v3`。模型越大越準，但需要更多記憶體。
+第一次使用某個模型時會自動下載。程式預設固定使用 CPU `int8`，建議先用 `small`；模型越大通常越準，但會需要更多記憶體與辨識時間。
 
 ## 輸出
 
@@ -30,7 +30,7 @@ Windows 10/11 本機電腦聲音與麥克風逐字稿工具。它透過 SoundCar
 - **曾出現 `pa_front.c` assertion**：目前版本已移除 PyAudioWPatch／PortAudio，改由 SoundCard 與 miniaudio 直接使用 Windows WASAPI；請重新執行 `install.bat` 更新虛擬環境。
 - **麥克風沒有聲音**：到 Windows「隱私權與安全性 → 麥克風」允許桌面應用程式存取麥克風。
 - **辨識很慢**：改用 `tiny` 或 `base`；關閉其他占用 GPU／CPU 的程式。
-- **缺少 cublas／cuDNN DLL**：程式會自動切換至 CPU 並重試，不需要另外安裝 CUDA。若想使用 NVIDIA GPU 加速，再另行安裝與 CTranslate2 相容的 CUDA 及 cuDNN。
+- **是否需要 CUDA**：不需要。程式預設固定使用 CPU，不會載入 cuBLAS／cuDNN。
 - **沒有文字**：確認選的是實際播放聲音的裝置，並提高系統播放音量。
 - **首次啟動很久**：正在下載模型，等待完成即可；之後會使用快取。
 
